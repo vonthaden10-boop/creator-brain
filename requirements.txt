@@ -1,0 +1,4 @@
+modal
+supabase
+anthropic
+httpx
