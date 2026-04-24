@@ -6,7 +6,6 @@ inserts posts + comments into Supabase, then classifies each comment.
 
 import modal
 import os
-import json
 import httpx
 from datetime import datetime, timezone
 
@@ -14,7 +13,8 @@ app = modal.App("creator-brain")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("supabase", "anthropic", "httpx")
+    .pip_install("supabase", "anthropic", "httpx", "fastapi[standard]")
+    .add_local_python_source("classify")
 )
 
 
@@ -22,12 +22,12 @@ def get_supabase():
     from supabase import create_client
     return create_client(
         os.environ["SUPABASE_URL"],
-        os.environ["SUPABASE_SERVICE_KEY"]
+        os.environ["SUPABASE_SERVICE_KEY"],
     )
 
 
 # ---------------------------------------------------------------------------
-# Classification worker — runs as a background Modal function per comment
+# Classification worker — background Modal function, one per comment
 # ---------------------------------------------------------------------------
 
 @app.function(
@@ -37,8 +37,6 @@ def get_supabase():
 )
 def classify_and_store(comment_id: str, comment_text: str, platform: str):
     """Classify a single comment and write results back to Supabase."""
-    import sys
-    sys.path.insert(0, "/root")
     from classify import classify_comment
 
     supabase = get_supabase()
@@ -67,11 +65,11 @@ def classify_and_store(comment_id: str, comment_text: str, platform: str):
     image=image,
     secrets=[modal.Secret.from_name("creator-brain-secrets")],
 )
-@modal.web_endpoint(method="POST", label="apify-webhook")
+@modal.fastapi_endpoint(method="POST", label="apify-webhook")
 async def apify_webhook(body: dict):
     """
     Receives Apify webhook on actor run completion.
-    Expected payload shape:
+    Payload shape:
     {
       "eventType": "ACTOR.RUN.SUCCEEDED",
       "resource": {
@@ -85,7 +83,7 @@ async def apify_webhook(body: dict):
     resource = body.get("resource", {})
     status = resource.get("status", "")
 
-    print(f"[webhook] Received event={event_type} status={status}")
+    print(f"[webhook] event={event_type} status={status}")
 
     if status != "SUCCEEDED":
         print(f"[webhook] Skipping — run status is {status}")
@@ -114,33 +112,27 @@ async def apify_webhook(body: dict):
 
     for item in items:
         try:
-            post_uuid = await upsert_post(supabase, item, platform, post_cache)
-            comment_uuid = await upsert_comment(supabase, item, platform, post_uuid)
+            post_uuid = upsert_post(supabase, item, platform, post_cache)
+            comment_uuid = upsert_comment(supabase, item, platform, post_uuid)
             if comment_uuid:
                 inserted_comments += 1
-                # Spawn classification as background task
-                classify_and_store.spawn(
-                    comment_uuid,
-                    item.get("text", ""),
-                    platform,
-                )
+                classify_and_store.spawn(comment_uuid, item.get("text", ""), platform)
         except Exception as e:
-            print(f"[webhook] Error processing item {item.get('id')}: {e}")
+            print(f"[webhook] Error on item {item.get('id')}: {e}")
             continue
 
-    # Mark post scrape_status = complete
-    for platform_post_id, post_uuid in post_cache.items():
+    # Mark all touched posts as complete
+    for post_uuid in set(post_cache.values()):
         supabase.table("posts").update({
             "scrape_status": "complete",
             "scraped_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", post_uuid).execute()
 
-    print(f"[webhook] Done. inserted_comments={inserted_comments}")
+    print(f"[webhook] Done. inserted={inserted_comments}")
     return {"ok": True, "inserted": inserted_comments}
 
 
 async def fetch_apify_dataset(dataset_id: str, api_key: str) -> list[dict]:
-    """Fetch all items from an Apify dataset."""
     url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
     params = {"token": api_key, "format": "json", "limit": 5000}
     async with httpx.AsyncClient(timeout=30) as client:
@@ -149,60 +141,36 @@ async def fetch_apify_dataset(dataset_id: str, api_key: str) -> list[dict]:
         return resp.json()
 
 
-async def upsert_post(
-    supabase,
-    item: dict,
-    platform: str,
-    cache: dict,
-) -> str:
-    """
-    Upsert the parent post from a comment item.
-    Returns the Supabase post UUID.
-    Apify TikTok comments include videoMeta on each comment row.
-    """
+def upsert_post(supabase, item: dict, platform: str, cache: dict) -> str:
+    """Upsert parent post from a comment item. Returns Supabase post UUID."""
     video_meta = item.get("videoMeta") or {}
-    platform_post_id = str(video_meta.get("id") or item.get("videoId") or "unknown")
+    platform_post_id = str(
+        video_meta.get("id") or item.get("videoId") or "unknown"
+    )
 
     if platform_post_id in cache:
         return cache[platform_post_id]
 
-    post_data = {
+    result = supabase.table("posts").upsert({
         "platform": platform,
         "platform_post_id": platform_post_id,
         "url": video_meta.get("url") or item.get("videoUrl") or None,
         "scrape_status": "scraping",
-    }
-
-    # Upsert on platform_post_id — safe to call multiple times
-    result = (
-        supabase.table("posts")
-        .upsert(post_data, on_conflict="platform_post_id")
-        .execute()
-    )
+    }, on_conflict="platform_post_id").execute()
 
     post_uuid = result.data[0]["id"]
     cache[platform_post_id] = post_uuid
     return post_uuid
 
 
-async def upsert_comment(
-    supabase,
-    item: dict,
-    platform: str,
-    post_uuid: str,
-) -> str | None:
-    """
-    Upsert a single comment row. Returns the Supabase comment UUID, or None if skipped.
-    Apify TikTok Comments Scraper output fields:
-      id, text, createTime, authorMeta.name, diggCount
-    """
+def upsert_comment(supabase, item: dict, platform: str, post_uuid: str) -> str | None:
+    """Upsert a single comment. Returns Supabase comment UUID or None if skipped."""
     platform_comment_id = str(item.get("id", ""))
     text = (item.get("text") or "").strip()
 
     if not platform_comment_id or not text:
         return None
 
-    # Parse createTime (Unix timestamp)
     create_time = item.get("createTime")
     posted_at = None
     if create_time:
@@ -211,23 +179,16 @@ async def upsert_comment(
         except (ValueError, TypeError):
             pass
 
-    author = (item.get("authorMeta") or {})
-    author_username = author.get("name") or author.get("uniqueId") or None
+    author = item.get("authorMeta") or {}
 
-    comment_data = {
+    result = supabase.table("comments").upsert({
         "post_id": post_uuid,
         "platform": platform,
         "platform_comment_id": platform_comment_id,
-        "author_username": author_username,
+        "author_username": author.get("name") or author.get("uniqueId") or None,
         "text": text,
         "likes": int(item.get("diggCount") or item.get("likeCount") or 0),
         "posted_at": posted_at,
-    }
-
-    result = (
-        supabase.table("comments")
-        .upsert(comment_data, on_conflict="platform_comment_id")
-        .execute()
-    )
+    }, on_conflict="platform_comment_id").execute()
 
     return result.data[0]["id"]
