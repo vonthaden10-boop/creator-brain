@@ -143,10 +143,9 @@ async def fetch_apify_dataset(dataset_id: str, api_key: str) -> list[dict]:
 
 def upsert_post(supabase, item: dict, platform: str, cache: dict) -> str:
     """Upsert parent post from a comment item. Returns Supabase post UUID."""
-    video_meta = item.get("videoMeta") or {}
-    platform_post_id = str(
-        video_meta.get("id") or item.get("videoId") or "unknown"
-    )
+    video_url = item.get("videoWebUrl") or item.get("submittedVideoUrl") or ""
+    # Extract video ID from URL: last path segment
+    platform_post_id = video_url.rstrip("/").split("/")[-1] if video_url else "unknown"
 
     if platform_post_id in cache:
         return cache[platform_post_id]
@@ -154,7 +153,7 @@ def upsert_post(supabase, item: dict, platform: str, cache: dict) -> str:
     result = supabase.table("posts").upsert({
         "platform": platform,
         "platform_post_id": platform_post_id,
-        "url": video_meta.get("url") or item.get("videoUrl") or None,
+        "url": video_url or None,
         "scrape_status": "scraping",
     }, on_conflict="platform_post_id").execute()
 
@@ -165,7 +164,8 @@ def upsert_post(supabase, item: dict, platform: str, cache: dict) -> str:
 
 def upsert_comment(supabase, item: dict, platform: str, post_uuid: str) -> str | None:
     """Upsert a single comment. Returns Supabase comment UUID or None if skipped."""
-    platform_comment_id = str(item.get("id", ""))
+    # Actual Apify field names: cid=comment ID, uniqueId=username
+    platform_comment_id = str(item.get("cid") or item.get("id") or "")
     text = (item.get("text") or "").strip()
 
     if not platform_comment_id or not text:
@@ -179,13 +179,11 @@ def upsert_comment(supabase, item: dict, platform: str, post_uuid: str) -> str |
         except (ValueError, TypeError):
             pass
 
-    author = item.get("authorMeta") or {}
-
     result = supabase.table("comments").upsert({
         "post_id": post_uuid,
         "platform": platform,
         "platform_comment_id": platform_comment_id,
-        "author_username": author.get("name") or author.get("uniqueId") or None,
+        "author_username": item.get("uniqueId") or item.get("uid") or None,
         "text": text,
         "likes": int(item.get("diggCount") or item.get("likeCount") or 0),
         "posted_at": posted_at,

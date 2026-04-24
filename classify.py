@@ -1,6 +1,9 @@
 import os
 import json
 import anthropic
+from dotenv import load_dotenv
+
+load_dotenv()
 
 client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
@@ -43,6 +46,12 @@ def classify_comment(comment_text: str, platform: str = "tiktok") -> dict:
     )
 
     raw = message.content[0].text.strip()
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        raw = raw.split("```", 2)[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
     result = json.loads(raw)
 
     # Enforce types and clamp superfan_score
